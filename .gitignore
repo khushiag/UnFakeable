@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+cache/
+artifacts/
+weights/
+*.egg-info/
+scripts/faceforensics_download_v4.py
+scripts/faceforensics_download_v4.py
+*.mp4
+*.zip
+*.pth

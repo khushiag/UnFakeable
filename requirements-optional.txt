@@ -1,0 +1,3 @@
+# Optional: MediaPipe face detector, used only on frames where MTCNN finds no face.
+# Skip it if pip complains about numpy versions - the pipeline runs fine with MTCNN alone.
+mediapipe>=0.10

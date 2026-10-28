@@ -1,0 +1,44 @@
+# Plumbing check on SYNTHETIC clips (NOT deepfakes). Proves the install works; its numbers mean nothing.
+#   python -m unfakeable.cli make-synthetic --config configs/smoke_synthetic.yaml
+#   python -m unfakeable.cli all --config configs/smoke_synthetic.yaml
+run_name: smoke_synthetic
+note: "SYNTHETIC smoke test - these metrics say nothing about deepfake detection"
+
+paths:
+  ffpp_root: data/synthetic/FaceForensics++
+  celebdf_root: data/synthetic/Celeb-DF-v2
+
+data:
+  ffpp_fake_methods: [Deepfakes, FaceSwap]
+  ffpp_max_real: 40
+  test_size: 0.25
+  celebdf_use_official_test_list: false
+  celebdf_max_per_class: 16
+
+preproc:
+  n_frames: 8
+temporal:
+  epochs: 10
+fusion:
+  n_components: 16
+
+tuning:
+  cv_folds: 3
+  n_jobs: -1
+  classifiers:
+    svm_rbf: {search: grid, space: {C: [1, 10], gamma: [scale]}}
+    random_forest: {search: random, n_iter: 2, space: {n_estimators: [100], max_depth: [null, 8]}}
+    xgboost: {search: random, n_iter: 2, space: {n_estimators: [100], max_depth: [3, 4]}}
+
+eval:
+  shap_max_samples: 30
+  permutation_repeats: 2
+
+gradcam:
+  videos_per_class: 2
+
+robustness:
+  max_videos_per_set: 20
+  jpeg_qualities: [70, 30]
+  blur_sigmas: [2.0]
+  downscale_factors: [0.5]

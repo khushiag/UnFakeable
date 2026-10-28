@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unfakeable"
+version = "0.2.0"
+description = "Deepfake detection: frozen EfficientNet-B0 + LSTM autoencoder features, SVM / Random Forest / XGBoost decisions"
+requires-python = ">=3.10"
+
+[project.scripts]
+unfakeable = "unfakeable.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"unfakeable.app" = ["static/*.html"]

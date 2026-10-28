@@ -1,0 +1,22 @@
+# Bigger run for more stable numbers once the default run works.
+# Uses the same cache as default.yaml (identical preprocessing), so only new videos are processed.
+# Run:  python -m unfakeable.cli all --config configs/large.yaml
+run_name: ffpp_to_celebdf_large
+seed: 42
+
+paths:
+  ffpp_root: data/FaceForensics++
+  celebdf_root: data/Celeb-DF-v2
+
+data:
+  ffpp_max_real: 400                  # 400 real + 400 fake (100 per manipulation method), if that many exist
+  celebdf_max_per_class: null         # entire official Celeb-DF v2 test list
+
+preproc:
+  device: auto
+spatial:
+  device: auto
+temporal:
+  device: auto
+tuning:
+  n_jobs: -1

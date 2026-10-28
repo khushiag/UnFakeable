@@ -1,0 +1,64 @@
+# UnFakeable - default experiment (matches report sections 4.2 and 6.3).
+# Paths are relative to the project folder; change them if your data lives elsewhere.
+run_name: ffpp_to_celebdf
+seed: 42
+note: ""
+
+paths:
+  ffpp_root: data/FaceForensics++     # must contain original_sequences/ and manipulated_sequences/
+  celebdf_root: data/Celeb-DF-v2      # must contain Celeb-real/, Celeb-synthesis/, YouTube-real/, List_of_testing_videos.txt
+  artifacts_dir: artifacts            # results: artifacts/<run_name>/
+  cache_dir: cache                    # face crops + embeddings (safe to delete, rebuilt on demand)
+  weights_dir: weights
+
+data:
+  ffpp_compression: c23
+  ffpp_fake_methods: [Deepfakes, Face2Face, FaceSwap, NeuralTextures]
+  ffpp_max_real: 100                  # null = every real video; fakes are matched 1:1, round-robin over methods
+  test_size: 0.2                      # 20 % of FF++ source groups held out
+  celebdf_use_official_test_list: true
+  celebdf_max_per_class: 60           # null = whole official test list (518 videos)
+
+preproc:
+  n_frames: 16
+  face_size: 224
+  margin: 0.3
+  detect_max_side: 640
+  mtcnn_min_confidence: 0.9
+  use_mediapipe_fallback: true        # only used if the optional mediapipe package is installed
+  min_face_ratio: 0.5
+  device: auto                        # auto = RTX 3050 when the CUDA build of PyTorch is installed
+
+spatial:
+  backbone_source: auto               # torchvision ImageNet weights, GitHub mirror as fallback
+  batch_size: 64                      # fits easily in 6 GB; lower to 32 if you ever see CUDA out-of-memory
+  device: auto
+
+temporal:
+  enabled: true
+  cell: lstm                          # or gru
+  input_mode: diff
+  hidden_size: 128
+  epochs: 30
+  lr: 0.001
+  device: auto
+
+fusion:
+  n_components: 64
+  block_weighting: sqrt_dim
+
+feature_sets: [spatial, fused, handcrafted]
+
+tuning:
+  cv_folds: 5
+  n_jobs: -1                          # Random Forest / XGBoost use all CPU cores
+
+gradcam:
+  enabled: true
+  videos_per_class: 3
+  frames_per_video: 4
+
+robustness:
+  enabled: true
+  max_videos_per_set: 100
+  feature_sets: [spatial, fused]
