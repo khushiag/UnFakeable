@@ -1,4 +1,6 @@
-# UnFakeable - default experiment (matches report sections 4.2 and 6.3).
+# UnFakeable - default experiment.
+# v0.3 changes (after the first real run scored ~0.5 AUC): 400 real + 400 fake FF++ videos, multi-layer texture
+# features from the frozen EfficientNet-B0, and frame-level training with a video-level decision.
 # Paths are relative to the project folder; change them if your data lives elsewhere.
 run_name: ffpp_to_celebdf
 seed: 42
@@ -14,10 +16,10 @@ paths:
 data:
   ffpp_compression: c23
   ffpp_fake_methods: [Deepfakes, Face2Face, FaceSwap, NeuralTextures]
-  ffpp_max_real: 100                  # null = every real video; fakes are matched 1:1, round-robin over methods
+  ffpp_max_real: 400                  # uses up to 400 real videos (fewer if fewer are downloaded); fakes matched 1:1
   test_size: 0.2                      # 20 % of FF++ source groups held out
   celebdf_use_official_test_list: true
-  celebdf_max_per_class: 60           # null = whole official test list (518 videos)
+  celebdf_max_per_class: 100          # null = whole official test list (518 videos)
 
 preproc:
   n_frames: 16
@@ -30,8 +32,9 @@ preproc:
   device: auto                        # auto = RTX 3050 when the CUDA build of PyTorch is installed
 
 spatial:
-  backbone_source: auto               # torchvision ImageNet weights, GitHub mirror as fallback
-  batch_size: 64                      # fits easily in 6 GB; lower to 32 if you ever see CUDA out-of-memory
+  backbone_source: auto               # torchvision ImageNet EfficientNet-B0 (GitHub mirror as fallback)
+  layers: multi                       # final pooled features + texture statistics of 4 intermediate blocks
+  batch_size: 64                      # lower to 32 if you ever see CUDA out-of-memory
   device: auto
 
 temporal:
@@ -47,7 +50,11 @@ fusion:
   n_components: 64
   block_weighting: sqrt_dim
 
-feature_sets: [spatial, fused, handcrafted]
+feature_sets: [spatial, fused, handcrafted, all]
+
+train:
+  granularity: frame                  # classify each frame, average the probabilities per video
+  frames_per_video: 8                 # frames per TRAINING video (all 16 are used when testing)
 
 tuning:
   cv_folds: 5

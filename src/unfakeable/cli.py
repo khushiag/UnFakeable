@@ -51,8 +51,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--config", default=None)
     ap.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--input", help="video/image path (predict)")
-    ap.add_argument("--feature-set", default="fused")
-    ap.add_argument("--classifier", default="svm_rbf")
+    ap.add_argument("--feature-set", default=None, help="predict: default = the run's best model by cross-validation")
+    ap.add_argument("--classifier", default=None)
     ap.add_argument("--explain", action="store_true", help="predict: also compute Grad-CAM (base64 images)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
@@ -83,9 +83,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.stage == "predict":
         from unfakeable.pipeline.inference import UnFakeablePredictor
 
+        from unfakeable.pipeline.inference import best_model
+
         if not args.input:
             ap.error("predict needs --input <video or image>")
-        res = UnFakeablePredictor(str(cfg.run_dir), args.feature_set, args.classifier).predict(args.input, args.explain)
+        best = best_model(str(cfg.run_dir))
+        fs, clf = args.feature_set or best["feature_set"], args.classifier or best["classifier"]
+        res = UnFakeablePredictor(str(cfg.run_dir), fs, clf).predict(args.input, args.explain)
         if args.explain:  # keep the terminal readable
             res = {k: (f"<{len(v)} images>" if k in ("faces", "gradcam") else v) for k, v in res.items()}
         print(json.dumps(res, indent=2))

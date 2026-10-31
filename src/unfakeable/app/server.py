@@ -62,10 +62,13 @@ def create_app(run_dir: str):
                                 .reset_index(name="videos").to_json(orient="records"))
         plots = sorted(p.name for p in (run / "plots").glob("*.png")) if (run / "plots").exists() else []
         probe = run / "explain" / "gradcam_probe.json"
+        from unfakeable.pipeline.inference import best_model
+
         return {
+            "best": best_model(str(run)) if mdir.exists() else {},
             "run": str(run.resolve()), "run_name": run.name,
             "environment": json.loads((run / "environment.json").read_text()) if (run / "environment.json").exists() else {},
-            "models": models, "data_counts": counts,
+            "models": {k: [c for c in v if c != "gradcam_probe"] for k, v in models.items()}, "data_counts": counts,
             "metrics": _csv_records(run / "metrics" / "metrics_summary.csv"),
             "robustness": _csv_records(run / "robustness" / "robustness.csv"),
             "block_attribution": _csv_records(run / "explain" / "block_attribution.csv"),

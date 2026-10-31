@@ -15,6 +15,7 @@ requests>=2.31
 Pillow>=10.0
 shap>=0.44
 efficientnet_pytorch>=0.7.1
+open_clip_torch>=2.24        # only used by configs/clip.yaml (CLIP ViT-L/14 backbone)
 fastapi>=0.110
 uvicorn>=0.27
 python-multipart>=0.0.9

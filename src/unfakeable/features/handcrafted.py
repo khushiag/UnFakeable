@@ -51,9 +51,14 @@ def frame_features(rgb: np.ndarray, cfg: HandcraftedCfg) -> np.ndarray:
     return np.concatenate([_lbp_hist(gray, cfg), hog_v, _radial_spectrum(gray, cfg.spectrum_bins)]).astype(np.float32)
 
 
+def handcrafted_frame_features(frames: np.ndarray, cfg: HandcraftedCfg) -> np.ndarray:
+    """(T,H,W,3) uint8 -> (T,D) float32, one descriptor per frame."""
+    return np.stack([frame_features(f, cfg) for f in frames]).astype(np.float32)
+
+
 def handcrafted_features(frames: np.ndarray, cfg: HandcraftedCfg) -> np.ndarray:
     """(T,H,W,3) uint8 -> (D,) float32 (mean over frames)."""
-    return np.mean([frame_features(f, cfg) for f in frames], axis=0).astype(np.float32)
+    return handcrafted_frame_features(frames, cfg).mean(axis=0)
 
 
 def handcrafted_dim(cfg: HandcraftedCfg) -> int:

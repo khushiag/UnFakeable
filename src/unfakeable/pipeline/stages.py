@@ -19,13 +19,14 @@ from unfakeable.evaluation import explain as ex
 from unfakeable.evaluation import plots
 from unfakeable.evaluation.metrics import compute_metrics
 from unfakeable.evaluation.perturbations import build_conditions
-from unfakeable.features.assembler import FEATURE_SETS, build_matrix, mean_pool
+from unfakeable.features.assembler import FEATURE_SETS, build_frame_matrix, video_means
 from unfakeable.features.backbone import SpatialExtractor
-from unfakeable.features.handcrafted import handcrafted_features
+from unfakeable.features.featurize import featurize_crops, score_videos
+from unfakeable.features.handcrafted import handcrafted_frame_features
 from unfakeable.features.store import ArrayCache
 from unfakeable.features.temporal import TemporalEncoder, fit_temporal_encoder
 from unfakeable.features.transformer import BlockScalerPCA
-from unfakeable.models.classical import CLASSIFIER_NAMES, fake_scores, make_classifier
+from unfakeable.models.classical import CLASSIFIER_NAMES, make_classifier
 from unfakeable.models.tuning import tune_classifier
 from unfakeable.preprocessing.detectors import build_detector
 from unfakeable.preprocessing.video_preprocessor import PreprocessError, VideoFacePreprocessor
@@ -45,10 +46,16 @@ def _faces_cache(cfg: Config) -> ArrayCache:
     return ArrayCache(Path(cfg.paths.cache_dir) / "faces" / cfg.prep_fingerprint())
 
 
-def _make_extractor(cfg: Config, source: str = None) -> SpatialExtractor:
+def _make_extractor(cfg: Config, source: str = None, layers: str = None) -> SpatialExtractor:
     return SpatialExtractor(source or cfg.spatial.backbone_source, cfg.paths.weights_dir,
                             cfg.paths.efficientnet_weights_url, cfg.spatial.batch_size, cfg.spatial.device,
-                            cfg.preproc.face_size)
+                            cfg.preproc.face_size, layers or cfg.spatial.layers)
+
+
+def _extractor_from_run(cfg: Config) -> SpatialExtractor:
+    """The exact backbone + layer setting the run's features were built with."""
+    meta = load_json(_p(cfg, "features", "feature_meta.json"))
+    return _make_extractor(cfg, meta["backbone_source_used"], meta.get("spatial_layers", "final"))
 
 
 def _read_manifest(cfg: Config, name: str) -> pd.DataFrame:
@@ -148,15 +155,15 @@ def stage_features(cfg: Config) -> None:
     m = _read_manifest(cfg, "manifest_ok.csv")
     faces = _faces_cache(cfg)
     ext = _make_extractor(cfg)
-    emb_cache = ArrayCache(Path(cfg.paths.cache_dir) / "emb" / f"{cfg.prep_fingerprint()}-{ext.source_used}")
-    log.info("backbone source in use: %s (frozen, never trained on deepfake data)", ext.source_used)
+    emb_cache = ArrayCache(Path(cfg.paths.cache_dir) / "emb" / f"{cfg.prep_fingerprint()}-{ext.cache_tag}")
+    log.info("backbone in use: %s, layers=%s (frozen, never trained on deepfake data)", ext.source_used, ext.layers)
     for vid in tqdm(m.video_id, desc="embeddings", unit="video"):
         if not emb_cache.exists(vid):
             emb_cache.save(vid, ext.embed(faces.load(vid)))
-    emb = np.stack([emb_cache.load(v) for v in m.video_id])  # (N, T, 1280)
-    spatial = mean_pool(emb)
+    emb = np.stack([emb_cache.load(v) for v in m.video_id])  # (N, T, D) per-frame features
     train = (m.split == "train").to_numpy()
-    meta = {"backbone_source_used": ext.source_used, "n_videos": int(len(m)), "n_frames": int(emb.shape[1]),
+    meta = {"backbone_source_used": ext.source_used, "spatial_layers": ext.layers, "final_dim": ext.final_dim,
+            "spatial_dim": int(emb.shape[2]), "n_videos": int(len(m)), "n_frames": int(emb.shape[1]),
             "train_videos_used_for_temporal_fit": int(train.sum())}
     temporal = None
     out_dir = ensure_dir(_p(cfg, "features"))
@@ -167,17 +174,19 @@ def stage_features(cfg: Config) -> None:
         meta["temporal"] = {**enc.meta, "final_recon_mse": hist[-1], "history": hist}
     hand = None
     if cfg.handcrafted.enabled:
-        hc = ArrayCache(Path(cfg.paths.cache_dir) / "hand" / f"{cfg.prep_fingerprint()}-{cfg.handcrafted_fingerprint()}")
+        hc = ArrayCache(Path(cfg.paths.cache_dir) / "handf" / f"{cfg.prep_fingerprint()}-{cfg.handcrafted_fingerprint()}")
         for vid in tqdm(m.video_id, desc="handcrafted", unit="video"):
             if not hc.exists(vid):
-                hc.save(vid, handcrafted_features(faces.load(vid), cfg.handcrafted))
-        hand = np.stack([hc.load(v) for v in m.video_id])
-    X, blocks = build_matrix(spatial, temporal, hand)
+                hc.save(vid, handcrafted_frame_features(faces.load(vid), cfg.handcrafted))
+        hand = np.stack([hc.load(v) for v in m.video_id])  # (N, T, K)
+    Xf, vidx, blocks = build_frame_matrix(emb, temporal, hand)
+    X = video_means(Xf, vidx, len(m))
     np.savez_compressed(out_dir / "features.npz", X=X, video_ids=m.video_id.to_numpy().astype(str))
+    np.savez_compressed(out_dir / "frames.npz", X=Xf, video_index=vidx, video_ids=m.video_id.to_numpy().astype(str))
     meta["blocks"] = blocks
     save_json(blocks, out_dir / "blocks.json")
     save_json(meta, out_dir / "feature_meta.json")
-    log.info("feature matrix %s, blocks=%s", X.shape, blocks)
+    log.info("feature matrices: video %s, frame %s, blocks=%s", X.shape, Xf.shape, blocks)
 
 
 def _load_features(cfg: Config) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Tuple[int, int]]]:
@@ -189,6 +198,32 @@ def _load_features(cfg: Config) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Tup
     return m, z["X"], blocks
 
 
+def _load_frames(cfg: Config, m: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    path = _p(cfg, "features", "frames.npz")
+    if not path.exists():
+        raise FileNotFoundError(f"{path} missing - re-run the features stage (older runs only stored video rows)")
+    z = np.load(path, allow_pickle=False)
+    if list(z["video_ids"]) != list(m.video_id.astype(str)):
+        raise RuntimeError("frames.npz is out of sync with manifest_ok.csv - re-run the features stage")
+    return z["X"], z["video_index"]
+
+
+def _frame_positions(vidx: np.ndarray) -> np.ndarray:
+    """Position of every frame row inside its own video (0..T-1)."""
+    first = np.r_[0, np.flatnonzero(np.diff(vidx)) + 1]
+    pos = np.arange(len(vidx))
+    return pos - np.repeat(first, np.diff(np.r_[first, len(vidx)]))
+
+
+def _granularity(cfg: Config, fs: str = None, clf: str = None) -> str:
+    """Granularity a saved model was trained with (older runs: video)."""
+    if fs and clf:
+        mp = _p(cfg, "models", fs, f"{clf}.meta.json")
+        if mp.exists():
+            return load_json(mp).get("granularity", "video")
+    return cfg.train.granularity
+
+
 # ----------------------------------------------------------------------------- 4. train / tune / evaluate
 def _template(cfg: Config, blocks, use) -> BlockScalerPCA:
     return BlockScalerPCA(blocks=blocks, use=use, n_components=cfg.fusion.n_components,
@@ -197,9 +232,24 @@ def _template(cfg: Config, blocks, use) -> BlockScalerPCA:
 
 def stage_train(cfg: Config) -> pd.DataFrame:
     seed_everything(cfg.seed)
+    gran = cfg.train.granularity
     m, X, blocks = _load_features(cfg)
     y, groups, split = m.label.to_numpy(), m.group.to_numpy(), m.split.to_numpy()
-    masks = {"train": split == "train", "internal_test": split == "test", "external": split == "external"}
+    n = len(m)
+    vmask = {"train": split == "train", "internal_test": split == "test", "external": split == "external"}
+    Xf, vidx = _load_frames(cfg, m)
+    if gran == "frame":
+        pos = _frame_positions(vidx)
+        t = int(pos.max()) + 1
+        keep = np.unique(np.round(np.linspace(0, t - 1, min(cfg.train.frames_per_video, t))).astype(int))
+        fit_rows = vmask["train"][vidx] & np.isin(pos, keep)
+        X_fit, y_fit, g_fit = Xf[fit_rows], y[vidx][fit_rows], groups[vidx][fit_rows]
+        log.info("frame-level training: %d frame rows from %d training videos (%d frames each); "
+                 "a video's score = mean fake probability of all its frames", len(X_fit), vmask["train"].sum(), len(keep))
+    elif gran == "video":
+        X_fit, y_fit, g_fit = X[vmask["train"]], y[vmask["train"]], groups[vmask["train"]]
+    else:
+        raise ValueError(f"train.granularity must be 'frame' or 'video', got {gran!r}")
     rows: List[dict] = []
     curves: Dict[Tuple[str, str], Dict[str, tuple]] = {}
     cms: Dict[Tuple[str, str], Dict[str, list]] = {}
@@ -210,38 +260,41 @@ def stage_train(cfg: Config) -> pd.DataFrame:
             log.warning("skipping feature set %r: blocks %s not available", fs, [b for b in use if b not in blocks])
             continue
         tpl = _template(cfg, blocks, use)
-        tf = clone(tpl).fit(X[masks["train"]])  # scaler + PCA see TRAIN rows only
-        Xt = {k: tf.transform(X[mk]) for k, mk in masks.items() if mk.any()}
+        tf = clone(tpl).fit(X_fit)  # scaler + PCA see TRAIN rows only
+        Xt_fit = tf.transform(X_fit)
         mdir = ensure_dir(_p(cfg, "models", fs))
         joblib.dump(tf, mdir / "transformer.joblib")
-        log.info("[%s] feature matrix: train %s -> %d dims (all classifiers use this exact matrix)", fs,
-                 Xt["train"].shape, tf.n_features_out_)
+        log.info("[%s] training matrix %s -> %d dims (all classifiers use this exact matrix)", fs,
+                 X_fit.shape, tf.n_features_out_)
         for clf in clfs:
-            res = tune_classifier(clf, X[masks["train"]], y[masks["train"]], groups[masks["train"]], tpl,
-                                  cfg.tuning, cfg.seed)
+            res = tune_classifier(clf, X_fit, y_fit, g_fit, tpl, cfg.tuning, cfg.seed)
             ensure_dir(_p(cfg, "tuning"))
             res.cv_results.drop(columns=["params"]).to_csv(_p(cfg, "tuning", f"{fs}__{clf}_cv_results.csv"), index=False)
-            ytr = y[masks["train"]]
             final = make_classifier(clf, res.best_params, cfg.seed, cfg.tuning.n_jobs, probability=True,
-                                    scale_pos_weight=float((ytr == 0).sum() / max((ytr == 1).sum(), 1)))
-            fit_hash = sha256_array(Xt["train"])
-            final.fit(Xt["train"], ytr)
+                                    scale_pos_weight=float((y_fit == 0).sum() / max((y_fit == 1).sum(), 1)))
+            fit_hash = sha256_array(Xt_fit)
+            final.fit(Xt_fit, y_fit)
             joblib.dump(final, mdir / f"{clf}.joblib")
-            save_json({"best_params": res.best_params, "feature_set": fs, "classifier": clf,
-                       "train_matrix_sha256": fit_hash, "seed": cfg.seed}, mdir / f"{clf}.meta.json")
+            save_json({"best_params": res.best_params, "feature_set": fs, "classifier": clf, "granularity": gran,
+                       "train_matrix_sha256": fit_hash, "seed": cfg.seed, **res.cv_metrics}, mdir / f"{clf}.meta.json")
             for ev in ("internal_test", "external"):
-                if ev not in Xt:
+                if not vmask[ev].any():
                     continue
-                score, pred = fake_scores(final, Xt[ev]), final.predict(Xt[ev])
-                mt = compute_metrics(y[masks[ev]], pred, score)
-                pd.DataFrame({"video_id": m.video_id[masks[ev]].to_numpy(), "dataset": m.dataset[masks[ev]].to_numpy(),
-                              "method": m.method[masks[ev]].to_numpy(), "label": y[masks[ev]],
+                vids = np.flatnonzero(vmask[ev])
+                rmask = vmask[ev][vidx]
+                remap = np.full(n, -1)
+                remap[vids] = np.arange(len(vids))
+                score, _ = score_videos(final, tf, Xf[rmask], remap[vidx[rmask]], len(vids), gran)
+                pred = (score >= 0.5).astype(int)
+                mt = compute_metrics(y[vids], pred, score)
+                pd.DataFrame({"video_id": m.video_id.to_numpy()[vids], "dataset": m.dataset.to_numpy()[vids],
+                              "method": m.method.to_numpy()[vids], "label": y[vids],
                               "score_fake": score, "pred": pred}
                              ).to_csv(ensure_dir(_p(cfg, "predictions")) / f"{fs}__{clf}__{ev}.csv", index=False)
                 rows.append({"feature_set": fs, "classifier": clf, "eval_set": ev, **{k: v for k, v in mt.items()},
-                             "n_train": int(masks["train"].sum()), "n_features": int(tf.n_features_out_),
+                             "granularity": gran, "n_train_rows": int(len(X_fit)), "n_features": int(tf.n_features_out_),
                              "train_matrix_sha256": fit_hash, "best_params": res.best_params, **res.cv_metrics})
-                curves.setdefault((fs, ev), {})[clf] = (y[masks[ev]], score)
+                curves.setdefault((fs, ev), {})[clf] = (y[vids], score)
                 cms.setdefault((fs, ev), {})[clf] = mt["confusion_matrix"]
                 log.info("[%s | %-13s | %-13s] acc=%.3f f1=%.3f auc=%s", fs, clf, ev, mt["accuracy"], mt["f1"],
                          "n/a" if mt["roc_auc"] is None else f"{mt['roc_auc']:.3f}")
@@ -270,17 +323,24 @@ def stage_explain(cfg: Config) -> pd.DataFrame:
     y, split = m.label.to_numpy(), m.split.to_numpy()
     te = split == "test"
     rows = []
+    rng = np.random.default_rng(cfg.seed)
     for fs in cfg.feature_sets:
         tpath = _p(cfg, "models", fs, "transformer.joblib")
         if not tpath.exists():
             continue
         tf = joblib.load(tpath)
-        Xte, yte = tf.transform(X[te]), y[te]
         names = tf.feature_names_out()
         for clf in CLASSIFIER_NAMES:
             mpath = _p(cfg, "models", fs, f"{clf}.joblib")
             if not mpath.exists():
                 continue
+            if _granularity(cfg, fs, clf) == "frame":  # explain on the same kind of rows the model was fit on
+                Xf, vidx = _load_frames(cfg, m)
+                rows_te = np.flatnonzero(te[vidx])
+                rows_te = rng.permutation(rows_te)[:1000]  # cap keeps permutation importance quick
+                Xte, yte = tf.transform(Xf[rows_te]), y[vidx][rows_te]
+            else:
+                Xte, yte = tf.transform(X[te]), y[te]
             model = joblib.load(mpath)
             native = ex.native_importance(model)
             perm = (ex.permutation_component_importance(model, Xte, yte, cfg.eval.permutation_repeats, cfg.seed)
@@ -322,7 +382,12 @@ def stage_gradcam(cfg: Config) -> pd.DataFrame:
     seed_everything(cfg.seed)
     gc = cfg.gradcam
     m, X, blocks = _load_features(cfg)
-    a, b = blocks["spatial"]
+    ext = _extractor_from_run(cfg)
+    if not ext.supports_gradcam:
+        log.info("Grad-CAM skipped: backbone %s has no convolutional feature map", ext.source_used)
+        return pd.DataFrame()
+    a = blocks["spatial"][0]
+    b = a + ext.final_dim  # the final pooled features come first in the spatial block
     y, split = m.label.to_numpy(), m.split.to_numpy()
     tr = split == "train"
     probe = LinearProbe.fit(X[tr, a:b], y[tr], cfg.seed)
@@ -335,8 +400,6 @@ def stage_gradcam(cfg: Config) -> pd.DataFrame:
     ensure_dir(_p(cfg, "models"))
     joblib.dump(probe, _p(cfg, "models", "gradcam_probe.joblib"))
     save_json(info, _p(cfg, "explain", "gradcam_probe.json"))
-    meta = load_json(_p(cfg, "features", "feature_meta.json"))
-    ext = _make_extractor(cfg, source=meta["backbone_source_used"])
     faces = _faces_cache(cfg)
     rng = np.random.default_rng(cfg.seed)
     rows = []
@@ -368,34 +431,18 @@ def stage_gradcam(cfg: Config) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------- 7. robustness
-def _features_from_crops(crops: List[np.ndarray], ext: SpatialExtractor, enc, hand_cfg, blocks,
-                         need_hand: bool) -> np.ndarray:
-    """Build a feature matrix with the SAME column layout as training (unused blocks stay zero)."""
-    X = np.zeros((len(crops), max(b for _, b in blocks.values())), dtype=np.float32)
-    emb = np.stack([ext.embed(c) for c in crops])
-    a, b = blocks["spatial"]
-    X[:, a:b] = mean_pool(emb)
-    if enc is not None and "temporal" in blocks:
-        a, b = blocks["temporal"]
-        X[:, a:b] = enc.transform(emb)
-    if need_hand and "handcrafted" in blocks:
-        a, b = blocks["handcrafted"]
-        X[:, a:b] = np.stack([handcrafted_features(c, hand_cfg) for c in crops])
-    return X
-
-
 def stage_robustness(cfg: Config) -> pd.DataFrame:
     seed_everything(cfg.seed)
     rc = cfg.robustness
     m = _read_manifest(cfg, "manifest_ok.csv")
     blocks = {k: tuple(v) for k, v in load_json(_p(cfg, "features", "blocks.json")).items()}
-    meta = load_json(_p(cfg, "features", "feature_meta.json"))
-    ext = _make_extractor(cfg, source=meta["backbone_source_used"])  # same backbone as training
+    ext = _extractor_from_run(cfg)  # same backbone + layers as training
     enc_path = _p(cfg, "features", "temporal_encoder.pt")
     enc = TemporalEncoder.load(enc_path, cfg.temporal.device) if enc_path.exists() else None
     faces = _faces_cache(cfg)
     fsets = [fs for fs in rc.feature_sets if _p(cfg, "models", fs, "transformer.joblib").exists()]
     need_hand = any("handcrafted" in FEATURE_SETS[fs] for fs in fsets)
+    need_tem = any("temporal" in FEATURE_SETS[fs] for fs in fsets)
     models = {(fs, c): joblib.load(_p(cfg, "models", fs, f"{c}.joblib")) for fs in fsets for c in CLASSIFIER_NAMES
               if _p(cfg, "models", fs, f"{c}.joblib").exists()}
     tfs = {fs: joblib.load(_p(cfg, "models", fs, "transformer.joblib")) for fs in fsets}
@@ -411,10 +458,11 @@ def stage_robustness(cfg: Config) -> pd.DataFrame:
         crops_clean = [faces.load(v) for v in pick.video_id]
         y = pick.label.to_numpy()
         for label, kind, severity, fn in conds:
-            Xc = _features_from_crops([fn(c) for c in crops_clean], ext, enc, cfg.handcrafted, blocks, need_hand)
+            Xf, vidx = featurize_crops([fn(c) for c in crops_clean], ext, enc, cfg.handcrafted, blocks,
+                                       need_tem, need_hand)
             for (fs, clf), model in models.items():
-                Xt = tfs[fs].transform(Xc)
-                mt = compute_metrics(y, model.predict(Xt), fake_scores(model, Xt))
+                score, _ = score_videos(model, tfs[fs], Xf, vidx, len(pick), _granularity(cfg, fs, clf))
+                mt = compute_metrics(y, (score >= 0.5).astype(int), score)
                 rows.append({"eval_set": ev, "condition": label, "kind": kind, "severity": severity,
                              "feature_set": fs, "classifier": clf, "label": f"{fs}/{clf}", "n": mt["n"],
                              "accuracy": mt["accuracy"], "f1": mt["f1"], "roc_auc": mt["roc_auc"]})
@@ -452,6 +500,12 @@ def stage_report(cfg: Config) -> Path:
         e = load_json(env)
         out += [f"Environment: Python {e.get('python')}, torch {e.get('torch')}, scikit-learn {e.get('sklearn')}, "
                 f"XGBoost {e.get('xgboost')}, GPU: {e.get('gpu') or 'none (CPU)'}", ""]
+    fm = _p(cfg, "features", "feature_meta.json")
+    if fm.exists():
+        f = load_json(fm)
+        out += [f"Features: backbone `{f.get('backbone_source_used')}`, layers `{f.get('spatial_layers', 'final')}` "
+                f"({f.get('spatial_dim', '?')} values per frame), {f.get('n_frames')} frames per video. "
+                f"Classifiers trained at `{cfg.train.granularity}` level.", ""]
     man = _p(cfg, "manifests", "manifest_ok.csv")
     if man.exists():
         mdf = pd.read_csv(man)

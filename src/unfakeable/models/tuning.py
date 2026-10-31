@@ -41,7 +41,10 @@ def tune_classifier(name: str, X: np.ndarray, y: np.ndarray, groups: np.ndarray,
     cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     with tempfile.TemporaryDirectory() as tmp:  # caches the fold-wise scaler/PCA across candidates
         pipe = Pipeline([("prep", clone(transformer)), ("clf", est)], memory=tmp)
-        common = dict(scoring=SCORING, refit=False, cv=cv, n_jobs=1, error_score="raise")
+        # SVC itself is single-threaded, so its candidates/folds run in parallel; RF/XGBoost already use every
+        # core inside each fit (n_jobs on the model), so their search stays sequential to avoid oversubscription.
+        search_jobs = cfg.n_jobs if name == "svm_rbf" else 1
+        common = dict(scoring=SCORING, refit=False, cv=cv, n_jobs=search_jobs, error_score="raise")
         if spec.get("search", "random") == "grid":
             search = GridSearchCV(pipe, space, **common)
         else:

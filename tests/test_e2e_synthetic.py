@@ -1,5 +1,6 @@
 """End-to-end plumbing test on SYNTHETIC clips (not deepfakes). Uses UNTRAINED backbone weights for speed, so it checks
 that every stage runs and artifacts are coherent, never that detection works."""
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -22,7 +23,7 @@ def test_full_pipeline_runs_and_is_leak_free(tmp_path):
         "data.test_size=0.25", "data.celebdf_use_official_test_list=false", "data.celebdf_max_per_class=5",
         "preproc.n_frames=6", "preproc.device=cpu", "spatial.device=cpu", "temporal.device=cpu",
         "spatial.backbone_source=random", "temporal.hidden_size=8", "temporal.epochs=3",
-        "fusion.n_components=6", "feature_sets=[spatial,fused,handcrafted]", "tuning.cv_folds=3",
+        "fusion.n_components=6", "feature_sets=[spatial,fused,handcrafted,all]", "train.frames_per_video=3", "tuning.cv_folds=3",
         "tuning.classifiers.svm_rbf.space={C: [1], gamma: [scale]}",
         "tuning.classifiers.random_forest={search: random, n_iter: 1, space: {n_estimators: [30]}}",
         "tuning.classifiers.xgboost={search: random, n_iter: 1, space: {n_estimators: [20], max_depth: [2]}}",
@@ -41,7 +42,7 @@ def test_full_pipeline_runs_and_is_leak_free(tmp_path):
     S.stage_train(cfg)
 
     met = pd.read_csv(cfg.run_dir / "metrics" / "metrics_summary.csv")
-    assert set(met.feature_set) == {"spatial", "fused", "handcrafted"}
+    assert set(met.feature_set) == {"spatial", "fused", "handcrafted", "all"} and set(met.granularity) == {"frame"}
     assert set(met.classifier) == {"svm_rbf", "random_forest", "xgboost"} and set(met.eval_set) == {"internal_test", "external"}
     for fs, g in met.groupby("feature_set"):  # IDENTICAL feature matrix for the 3 classifiers
         assert g.train_matrix_sha256.nunique() == 1
@@ -64,7 +65,13 @@ def test_full_pipeline_runs_and_is_leak_free(tmp_path):
 
     pred_fn = UnFakeablePredictor(str(cfg.run_dir), "fused", "random_forest")
     r = pred_fn.predict(allm[allm.dataset == "celebdf"].iloc[0].path, explain=True)
-    assert 0.0 <= r["prob_fake"] <= 1.0 and r["label"] in ("real", "fake")
+    assert 0.0 <= r["prob_fake"] <= 1.0 and r["label"] in ("real", "fake") and r["granularity"] == "frame"
+    assert len(r["frame_probs_fake"]) == 6 and abs(np.mean(r["frame_probs_fake"]) - r["prob_fake"]) < 1e-9
+    # the predictor reproduces the evaluation score of the same video exactly
+    row = pd.read_csv(cfg.run_dir / "predictions" / "fused__random_forest__external.csv")
+    vid = allm[allm.dataset == "celebdf"].iloc[0].video_id
+    if vid in set(row.video_id):
+        assert abs(row.set_index("video_id").loc[vid, "score_fake"] - r["prob_fake"]) < 1e-6
     assert len(r["gradcam"]) == 4 and r["gradcam"][0].startswith("data:image/png;base64,")
     assert load_json(cfg.run_dir / "features" / "feature_meta.json")["backbone_source_used"] == "random"
 
@@ -75,6 +82,7 @@ def test_full_pipeline_runs_and_is_leak_free(tmp_path):
 
     client = TestClient(create_app(str(cfg.run_dir)))
     s = client.get("/api/summary").json()
+    assert s["best"]["feature_set"] in s["models"] and "gradcam_probe" not in sum(s["models"].values(), [])
     assert s["metrics"] and "fused" in s["models"] and any(p.startswith("roc__") for p in s["plots"])
     assert client.get(f"/api/plots/{s['plots'][0]}").status_code == 200
     assert client.get("/api/plots/..%2Fconfig_used.yaml").status_code == 404

@@ -1,0 +1,41 @@
+# Same experiment with a frozen CLIP ViT-L/14 as the feature extractor instead of EfficientNet-B0.
+# Run this if the default run is still weak; results go to artifacts/ffpp_to_celebdf_clip (face crops are reused).
+# First run downloads ~1.7 GB of CLIP weights from Hugging Face. Grad-CAM is skipped (ViT has no conv feature map).
+#   python -m unfakeable.cli all --config configs/clip.yaml
+run_name: ffpp_to_celebdf_clip
+seed: 42
+
+paths:
+  ffpp_root: data/FaceForensics++
+  celebdf_root: data/Celeb-DF-v2
+
+data:
+  ffpp_max_real: 400
+  celebdf_max_per_class: 100
+
+preproc:
+  device: auto
+
+spatial:
+  backbone_source: clip_vitl14
+  layers: final
+  batch_size: 32
+  device: auto
+
+temporal:
+  device: auto
+
+feature_sets: [spatial, fused, handcrafted, all]
+
+train:
+  granularity: frame
+  frames_per_video: 8
+
+tuning:
+  n_jobs: -1
+
+gradcam:
+  enabled: false
+
+robustness:
+  feature_sets: [spatial, fused]

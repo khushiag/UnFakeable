@@ -172,10 +172,10 @@ one at a time (each reads the previous stage's files, so you can re-run any of t
 
 | # | Command | What happens | Uses GPU |
 |---|---|---|---|
-| 1 | `manifest` | lists videos, builds identity groups, picks 100 real + 100 fake (25/method) from FF++, 60/class from the Celeb-DF test list, **splits FF++ 80/20 by group before any frame is read**, checks for leakage | – |
+| 1 | `manifest` | lists videos, builds identity groups, picks up to 400 real + 400 fake (100/method) from FF++, 100/class from the Celeb-DF test list, **splits FF++ 80/20 by group before any frame is read**, checks for leakage | – |
 | 2 | `preprocess` | 16 evenly spaced frames → MTCNN (conf ≥ 0.9) → eye-level alignment, 30 % margin, 224×224 → cached; videos with faces in < 50 % of frames are dropped and logged | yes (MTCNN) |
 | 3 | `features` | frozen EfficientNet-B0 embeddings; LSTM autoencoder trained **unsupervised** on train-split frame differences (30 epochs); LBP/HOG/spectrum | yes |
-| 4 | `train` | for each feature set (spatial / fused / handcrafted): scaler + PCA fitted on train rows; SVM grid search, RF and XGBoost random search with 5-fold **grouped** CV (ROC-AUC); refit on full train; evaluate on held-out FF++ and on Celeb-DF; ROC curves, confusion matrices, ablation charts | CPU |
+| 4 | `train` | for each feature set (spatial / fused / handcrafted / all): scaler + PCA fitted on train frame rows (8 frames per training video); SVM grid search, RF and XGBoost random search with 5-fold **grouped** CV (ROC-AUC); refit on full train; a video's score = mean of its 16 frame probabilities; evaluate on held-out FF++ and on Celeb-DF; ROC curves, confusion matrices, ablation charts | CPU |
 | 5 | `explain` | native + permutation importance, SHAP (RF/XGB), block attribution through PCA loadings | CPU |
 | 6 | `gradcam` | Grad-CAM heatmaps on the frozen backbone (see note below) | yes |
 | 7 | `robustness` | JPEG q90/70/50/30, blur σ1/2/3, down-scale ×0.5/×0.25 on up to 100 videos per set | yes |
@@ -237,8 +237,8 @@ Images work with `--feature-set spatial` or `handcrafted` (the fused set needs �
 
 ## 7. Bigger, more stable run
 
-Once the default run works: `scripts\run_training.bat configs\large.yaml` — 400 real + 400 fake FF++ videos and the
-whole Celeb-DF test list (if that many are on disk; `check-data` tells you). It reuses the face/embedding cache.
+Once the default run works: `scripts\run_training.bat configs\large.yaml` — every downloaded FF++ video and the
+whole Celeb-DF test list (518 videos). It reuses the face/embedding cache.
 
 ## 8. Troubleshooting
 
@@ -257,7 +257,27 @@ whole Celeb-DF test list (if that many are on disk; `check-data` tells you). It 
 `pytest` runs everything including the slow end-to-end test (~1 min on CPU): MTCNN on a real photo, the whole
 pipeline on synthetic clips, inference with Grad-CAM, and the dashboard API.
 
-## 9. Changes from the team's Drive version
+## 9. If the results are near 0.5 ROC-AUC (website "gets it backwards")
+
+0.5 ROC-AUC = guessing. When the cross-validation scores on the TRAINING split are also ~0.5, the classifiers found
+no usable signal in the features, and the website can only guess. The first real run (v0.2 settings: 159 training
+videos, final-layer ImageNet features averaged per video) ended exactly there. v0.3 changes three things:
+
+| Change | Why |
+| --- | --- |
+| 400 real + 400 fake FF++ videos (`data.ffpp_max_real: 400`) | ~20 videos per manipulation method is far too few |
+| `spatial.layers: multi` — texture statistics of 4 intermediate EfficientNet blocks added to the final features | final ImageNet features describe identity/pose/scene; blending and smoothing traces are low-level texture |
+| `train.granularity: frame` — classifiers learn from individual frames (8 per training video), a video's score is the mean frame probability | 8x more training rows; averaging 16 frames before classifying blurs the artefacts away |
+
+Still weak afterwards (held-out FF++ AUC < 0.7)? Run the same pipeline with a frozen CLIP ViT-L/14 as the feature
+extractor (`configs/clip.yaml`, results in `artifacts/ffpp_to_celebdf_clip`). Pick the run/model by its
+**cross-validation** score, not by the Celeb-DF score, and report both runs honestly as an ablation.
+
+Celeb-DF v2 is a different dataset that none of the models ever trained on; scores there are expected to be clearly
+lower than on FF++ (that gap is the generalisation question the project studies). For a fair demo, use videos from the
+held-out FF++ test split (listed in `predictions/*__internal_test.csv`) or Celeb-DF, never training videos.
+
+## 10. Changes from the team's Drive version
 
 * Devices default to `auto`: MTCNN, EfficientNet, the LSTM autoencoder and Grad-CAM run on the RTX 3050 when visible.
 * Dataset discovery tolerates wrapper folders, missing `videos\`, flat method folders; `check-data` command;
@@ -268,4 +288,7 @@ pipeline on synthetic clips, inference with Grad-CAM, and the dashboard API.
 * Accuracy-by-feature-set charts, confusion-matrix and environment sections in `REPORT.md`.
 * Windows setup/run scripts, `pyproject.toml` (`pip install -e .`), `gpu` self-check, image reading on paths
   with non-ASCII characters.
-* Tests: 37 → 42 (dataset-layout tolerance, paths with spaces, broken-fallback safety, Grad-CAM, dashboard API).
+* Tests: 37 → 46 (dataset-layout tolerance, paths with spaces, broken-fallback safety, Grad-CAM, dashboard API,
+  multi-layer/CLIP features, frame-level scoring, website score = evaluation score for the same video).
+* v0.3: frame-level training, multi-layer texture features, optional CLIP backbone (`configs/clip.yaml`), `all`
+  feature set, dashboard pre-selects the best model by cross-validation and warns when the run is weak.

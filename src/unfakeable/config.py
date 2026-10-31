@@ -90,7 +90,8 @@ class PreprocCfg:
 
 @dc.dataclass
 class SpatialCfg:
-    backbone_source: str = "auto"  # auto | torchvision | efficientnet_pytorch | random (tests only)
+    backbone_source: str = "auto"  # auto | torchvision | efficientnet_pytorch | clip_vitl14 | random (tests only)
+    layers: str = "multi"  # multi = final features + texture statistics of 4 intermediate blocks | final
     batch_size: int = 64
     device: str = "auto"
 
@@ -125,6 +126,12 @@ class HandcraftedCfg:
 class FusionCfg:
     n_components: Optional[float] = 64  # int = PCA components, 0<float<1 = variance ratio, null = no PCA
     block_weighting: str = "sqrt_dim"  # sqrt_dim | none
+
+
+@dc.dataclass
+class TrainCfg:
+    granularity: str = "frame"  # frame = classify every frame, average per video | video = one row per video
+    frames_per_video: int = 8  # frame rows per TRAINING video (evenly spaced); evaluation always uses all frames
 
 
 @dc.dataclass
@@ -174,6 +181,7 @@ class Config:
     handcrafted: HandcraftedCfg = dc.field(default_factory=HandcraftedCfg)
     fusion: FusionCfg = dc.field(default_factory=FusionCfg)
     feature_sets: List[str] = dc.field(default_factory=lambda: ["spatial", "fused", "handcrafted"])
+    train: TrainCfg = dc.field(default_factory=TrainCfg)
     tuning: TuneCfg = dc.field(default_factory=TuneCfg)
     eval: EvalCfg = dc.field(default_factory=EvalCfg)
     gradcam: GradcamCfg = dc.field(default_factory=GradcamCfg)

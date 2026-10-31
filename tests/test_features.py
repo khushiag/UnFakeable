@@ -142,3 +142,56 @@ def test_gradcam_maps_and_overlay():
     assert np.allclose(probs, 1 / (1 + np.exp(-probe.logit_np(emb[:2]))), atol=1e-3)  # same read-out as numpy
     ov = overlay(frames[0], cams[0])
     assert ov.shape == frames[0].shape and ov.dtype == np.uint8
+
+
+# ------------------------------------------------------------------ v0.3: multi-layer, CLIP, frame-level scoring
+def test_multi_layer_features_keep_final_first():
+    rng = np.random.default_rng(0)
+    frames = rng.integers(0, 255, (3, 224, 224, 3), dtype=np.uint8)
+    fin = SpatialExtractor("random", "weights", "", device="cpu", layers="final")
+    mul = SpatialExtractor("random", "weights", "", device="cpu", layers="multi")
+    a, b = fin.embed(frames), mul.embed(frames)
+    assert a.shape == (3, 1280) and b.shape == (3, 1280 + 2 * (24 + 40 + 80 + 112))
+    assert np.allclose(b[:, :1280], a, atol=1e-4)  # Grad-CAM relies on the final features coming first
+    assert mul.cache_tag == "random-multi" and fin.cache_tag == "random"
+    with pytest.raises(ValueError):
+        SpatialExtractor("random", "weights", "", device="cpu", layers="bogus")
+
+
+def test_clip_backbone_shapes():
+    pytest.importorskip("open_clip")
+    ext = SpatialExtractor("clip_random", "weights", "", batch_size=2, device="cpu", layers="multi")
+    assert ext.layers == "final" and not ext.supports_gradcam  # multi is EfficientNet-only, falls back
+    out = ext.embed(np.random.default_rng(0).integers(0, 255, (3, 96, 96, 3), dtype=np.uint8))
+    assert out.shape == (3, 768) and np.isfinite(out).all()
+
+
+def test_frame_matrix_and_video_means():
+    from unfakeable.features.assembler import build_frame_matrix, video_means
+
+    rng = np.random.default_rng(0)
+    emb, tem, hand = rng.normal(size=(4, 5, 6)), rng.normal(size=(4, 3)), rng.normal(size=(4, 5, 2))
+    Xf, vidx, blocks = build_frame_matrix(emb, tem, hand)
+    assert Xf.shape == (20, 11) and blocks == {"spatial": (0, 6), "temporal": (6, 9), "handcrafted": (9, 11)}
+    assert np.allclose(Xf[7, :6], emb[1, 2]) and np.allclose(Xf[7, 6:9], tem[1]) and vidx[7] == 1
+    Xv = video_means(Xf, vidx, 4)
+    assert np.allclose(Xv[:, :6], emb.mean(1), atol=1e-5) and np.allclose(Xv[:, 6:9], tem, atol=1e-5)
+
+
+def test_score_videos_frame_and_video_modes():
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+
+    from unfakeable.features.featurize import score_videos
+
+    rng = np.random.default_rng(0)
+    Xf = rng.normal(size=(12, 4))
+    vidx = np.repeat(np.arange(3), 4)
+    tf = StandardScaler().fit(Xf)
+    model = LogisticRegression().fit(tf.transform(Xf), np.tile([0, 1], 6))
+    sv, pf = score_videos(model, tf, Xf, vidx, 3, "frame")
+    assert np.allclose(sv, [pf[vidx == i].mean() for i in range(3)])
+    sv2, _ = score_videos(model, tf, Xf, vidx, 3, "video")
+    assert sv2.shape == (3,) and ((0 <= sv2) & (sv2 <= 1)).all()
+    with pytest.raises(ValueError):
+        score_videos(model, tf, Xf, vidx, 3, "nope")
